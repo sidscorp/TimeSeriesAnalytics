@@ -7,9 +7,10 @@ import json
 import math
 import re
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -55,6 +56,8 @@ _UNIT_ALIASES = {
     "month": "months",
     "months": "months",
 }
+
+_BOOLEAN_WORDS = re.compile(r"\b(and|or|not)\b", flags=re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -127,6 +130,43 @@ def _normalize_unit(token: str) -> Optional[str]:
   return normalized if normalized in _UNIT_SCALES else None
 
 
+def _normalize_query_string(query: str) -> str:
+  """Normalizes boolean operators, quotes phrases, and wraps OR groups."""
+
+  def _quote_phrases(text: str) -> str:
+    def replacer(match: re.Match) -> str:
+      phrase = match.group(1)
+      tokens = phrase.split()
+      if any(tok.upper() in {"AND", "OR", "NOT"} for tok in tokens):
+        return match.group(0)
+      return f'"{phrase}"'
+
+    return re.sub(r'(?<!")\b([A-Za-z0-9]+(?:\s+[A-Za-z0-9]+)+)\b(?!")', replacer, text)
+
+  def _strip_redundant_parens(text: str) -> str:
+    previous = None
+    current = text
+    while previous != current:
+      previous = current
+      current = re.sub(
+          r'\(([^()]*?)\)',
+          lambda m: m.group(1) if " OR " not in m.group(1) else m.group(0),
+          current,
+      )
+    return current
+
+  normalized = _quote_phrases(query)
+  normalized = _BOOLEAN_WORDS.sub(lambda match: match.group(0).upper(), normalized)
+  normalized = _strip_redundant_parens(normalized)
+
+  if " OR " in normalized:
+    match = re.search(r"\(([^\)]+ OR [^\)]+)\)", normalized)
+    if not match:
+      normalized = f"({normalized})"
+
+  return normalized.strip()
+
+
 def _parse_quantity_arg(
     raw_value: Optional[str],
     *,
@@ -162,6 +202,12 @@ def _parse_quantity_arg(
 
   scale = _UNIT_SCALES[unit_label]
   return UnitQuantity(magnitude, unit_label, magnitude * scale)
+
+
+def _log(logs: List[str], message: str, *, verbose: bool) -> None:
+  logs.append(message)
+  if verbose:
+    print(message)
 
 
 def fetch_timeline_vol(
@@ -204,7 +250,10 @@ def fetch_timeline_vol(
   try:
     return json.loads(payload.decode("utf-8"))
   except json.JSONDecodeError as exc:
-    raise RuntimeError("Failed to decode JSON payload from GDELT.") from exc
+    snippet = payload[:200].decode("utf-8", errors="replace")
+    raise RuntimeError(
+        "Failed to decode JSON payload from GDELT. Response snippet: " + snippet
+    ) from exc
 
 
 def timeline_to_daily_arrays(timeline_payload: Dict) -> Tuple[List[np.ndarray], List[List[datetime]]]:
@@ -253,16 +302,351 @@ def moving_average(values: np.ndarray, window: int) -> np.ndarray:
   return result
 
 
-def render_forecast_panels(
+def generate_forecast_artifacts(
+    *,
+    query: str,
+    mode: str = "TimelineVol",
+    timespan: Optional[str] = "52weeks",
+    start_datetime: Optional[str] = None,
+    end_datetime: Optional[str] = None,
+    timeline_smooth: Optional[int] = None,
+    extra_params: Optional[Dict[str, str]] = None,
+    series_index: int = 0,
+    models: Sequence[str] = ("timesfm",),
+    max_context: Optional[str] = None,
+    eval_window: Optional[str] = None,
+    horizon: Optional[str] = None,
+    smooth: Optional[str] = None,
+    timesfm_root: Optional[str] = None,
+    max_horizon_days: Optional[int] = None,
+    verbose: bool = True,
+) -> Tuple[TimeSeriesContext, List[ForecastBundle], Dict[str, object]]:
+  """Runs the full forecasting pipeline and returns artifacts for visualization."""
+
+  logs: List[str] = []
+  query = _normalize_query_string(query)
+  if not models:
+    raise SystemExit("At least one forecasting model must be specified.")
+
+  unit_label, _ = _resolve_units(smooth)
+  horizon_spec = _parse_quantity_arg(
+      horizon,
+      default_magnitude=182,
+      default_unit=unit_label,
+      param_name="horizon",
+  )
+  assert horizon_spec is not None
+  horizon_days = horizon_spec.days
+  horizon_unit_scale = _UNIT_SCALES[horizon_spec.unit_label]
+  if horizon_days < 20:
+    min_units = max(1, math.ceil(20 / horizon_unit_scale))
+    raise SystemExit(
+        f"horizon must be at least {min_units} {horizon_spec.unit_label} to satisfy a 4-point holdout (35% rule)."
+    )
+  if max_horizon_days is not None and horizon_days > max_horizon_days:
+    raise SystemExit(
+        f"horizon is capped at {max_horizon_days} days (app limit); requested {horizon_spec.magnitude} {horizon_spec.unit_label}."
+    )
+  if horizon_days > MAX_HORIZON_DAYS:
+    raise SystemExit(
+        f"horizon is capped at {MAX_HORIZON_DAYS} days (~5 years); requested {horizon_spec.magnitude} {horizon_spec.unit_label}."
+    )
+
+  eval_spec = _parse_quantity_arg(
+      eval_window,
+      default_magnitude=DEFAULT_EVAL_DAYS,
+      default_unit="days",
+      param_name="eval-window",
+  )
+
+  context_spec = _parse_quantity_arg(
+      max_context,
+      default_magnitude=None,
+      default_unit=unit_label,
+      param_name="max-context",
+  )
+
+  payload = fetch_timeline_vol(
+      query=query,
+      mode=mode,
+      timespan=timespan,
+      start_datetime=start_datetime,
+      end_datetime=end_datetime,
+      timeline_smooth=timeline_smooth,
+      extra_params=extra_params,
+      timeout=30.0,
+  )
+
+  arrays, timestamps = timeline_to_daily_arrays(payload)
+  if not arrays:
+    raise SystemExit("No timeline data returned for the given query.")
+
+  _log(logs, "Prepared TimesFM inputs (daily cadence):", verbose=verbose)
+  for idx, arr in enumerate(arrays):
+    _log(logs, f"Series {idx}: shape={arr.shape}, dtype={arr.dtype}", verbose=verbose)
+  _log(logs, str(arrays), verbose=verbose)
+
+  _log(logs, "\nCorresponding timestamps:", verbose=verbose)
+  for idx, times in enumerate(timestamps):
+    start = times[0]
+    end = times[-1]
+    _log(
+        logs,
+        f"Series {idx}: {len(times)} points from {start.isoformat()} to {end.isoformat()}",
+        verbose=verbose,
+    )
+
+  if series_index >= len(arrays) or series_index < 0:
+    raise SystemExit("series index out of range")
+
+  raw_values_all = arrays[series_index].astype(np.float32, copy=True)
+  raw_times_all = list(timestamps[series_index])
+
+  selected_values = raw_values_all
+  selected_times = raw_times_all
+
+  context_limit: Optional[int] = None
+  if context_spec is not None:
+    context_limit = context_spec.days
+    if len(selected_values) > context_limit:
+      _log(
+          logs,
+          f"Trimming context to last {context_limit} days (~{context_spec.magnitude} {context_spec.unit_label}).",
+          verbose=verbose,
+      )
+      selected_values = selected_values[-context_limit :]
+      selected_times = selected_times[-context_limit :]
+
+  full_raw_values = raw_values_all
+  full_raw_times = raw_times_all
+
+  smoothing_window = SMOOTH_WINDOWS.get(smooth) if smooth else None
+  if smoothing_window:
+    if len(selected_values) < smoothing_window:
+      _log(
+          logs,
+          f"Warning: smoothing window ({smoothing_window} days) exceeds available series length ({len(selected_values)}); partial averages will be used.",
+          verbose=verbose,
+      )
+    selected_values = moving_average(selected_values, smoothing_window)
+    _log(
+        logs,
+        f"\nApplied {smooth} smoothing (window {smoothing_window} days) before forecasting.",
+        verbose=verbose,
+    )
+
+  num_points = len(selected_values)
+  if num_points < 5:
+    raise SystemExit(
+        "Need at least 5 data points after preprocessing to run the evaluation backtest and future forecast."
+    )
+
+  max_holdout = max(0, num_points - 4)
+  if max_holdout <= 0:
+    raise SystemExit(
+        "Not enough data to reserve an evaluation window while preserving at least 4 context points."
+    )
+
+  requested_holdout = eval_spec.days
+  if requested_holdout > max_holdout:
+    _log(
+        logs,
+        f"Evaluation window ({requested_holdout} days) truncated to {max_holdout} days to preserve minimum context.",
+        verbose=verbose,
+    )
+    holdout_len = max_holdout
+  else:
+    holdout_len = requested_holdout
+
+  if holdout_len < 1:
+    raise SystemExit("Evaluation window collapsed; provide more data or reduce --eval-window.")
+
+  backtest_context_values = selected_values[:-holdout_len]
+  backtest_context_times = selected_times[:-holdout_len]
+  holdout_actual = selected_values[-holdout_len:]
+  holdout_times = selected_times[-holdout_len:]
+  context_len = len(backtest_context_values)
+  if context_len < 4:
+    raise SystemExit(
+        f"Not enough context ({context_len}) after reserving the evaluation window; need at least 4 points."
+    )
+  if context_len < 10:
+    _log(
+        logs,
+        f"Warning: only {context_len} context points available for the backtest; forecasts may be unstable.",
+        verbose=verbose,
+    )
+
+  if horizon_days > context_len * 3:
+    _log(
+        logs,
+        f"Warning: horizon spans {horizon_days} days (~{horizon_spec.magnitude} {horizon_spec.unit_label}), exceeding 3x the backtest context length ({context_len} days).",
+        verbose=verbose,
+    )
+
+  if len(selected_times) >= 2:
+    timestamp_cadence = selected_times[1] - selected_times[0]
+  elif len(backtest_context_times) >= 2:
+    timestamp_cadence = backtest_context_times[1] - backtest_context_times[0]
+  else:
+    raise SystemExit("Unable to infer timestamp cadence for the selected series.")
+  if timestamp_cadence <= timedelta(0):
+    raise SystemExit("Non-positive timestamp cadence detected; cannot proceed.")
+
+  context_metadata: Dict[str, object] = {}
+  if context_limit is not None:
+    context_metadata["max_context"] = context_limit
+  context_metadata["smoothed"] = bool(smoothing_window)
+
+  ts_context = TimeSeriesContext(
+      series_id=query,
+      timestamp_cadence=timestamp_cadence,
+      full_history=full_raw_values,
+      full_timestamps=full_raw_times,
+      context_values=backtest_context_values,
+      context_timestamps=backtest_context_times,
+      model_values=selected_values,
+      model_timestamps=selected_times,
+      holdout_values=holdout_actual,
+      holdout_timestamps=holdout_times,
+      forecast_horizon=horizon_days,
+      metadata=context_metadata,
+  )
+
+  bundles: List[ForecastBundle] = []
+  runner_args = SimpleNamespace(timesfm_root=timesfm_root)
+  for model_key in models:
+    runner = FORECAST_MODEL_REGISTRY.get(model_key)
+    if runner is None:
+      raise SystemExit(f"Unknown forecasting model '{model_key}'.")
+    model_label = MODEL_LABELS.get(model_key, model_key)
+
+    backtest_context = ts_context.with_context_override(
+        values=ts_context.context_values,
+        timestamps=ts_context.context_timestamps,
+        forecast_horizon=holdout_len,
+    )
+    backtest_result = runner(backtest_context, runner_args)
+    if backtest_result.point_forecast.shape[0] < holdout_len:
+      raise SystemExit(
+          f"{model_label} returned fewer steps than requested for the backtest window; cannot score MAPE."
+      )
+    backtest_forecast = backtest_result.point_forecast[:holdout_len]
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+      denom = np.abs(ts_context.holdout_values)
+      mask = denom > 1e-6
+      if np.any(mask):
+        mape = float(
+            np.mean(
+                np.abs((ts_context.holdout_values[mask] - backtest_forecast[mask]) / denom[mask])
+            )
+            * 100.0
+        )
+      else:
+        mape = float("nan")
+
+    future_context = ts_context.with_context_override(
+        values=ts_context.model_values,
+        timestamps=ts_context.model_timestamps,
+        forecast_horizon=ts_context.forecast_horizon,
+    )
+    future_result = runner(future_context, runner_args)
+
+    future_point_forecast = future_result.point_forecast
+    if future_point_forecast.size == 0:
+      raise SystemExit(f"{model_label} returned an empty future forecast.")
+    if future_point_forecast.shape[0] < horizon_days:
+      _log(
+          logs,
+          f"Warning: {model_label} future forecast returned {future_point_forecast.shape[0]} steps (requested {horizon_days}); plotting uses the returned length.",
+          verbose=verbose,
+      )
+
+    future_quantile_forecast = future_result.quantile_forecast
+    trimmed = False
+    if future_quantile_forecast is not None:
+      if future_quantile_forecast.ndim != 2 or future_quantile_forecast.shape[1] < 10:
+        _log(
+            logs,
+            f"Warning: {model_label} quantiles missing 10th/90th percentiles; interval shading disabled.",
+            verbose=verbose,
+        )
+        future_quantile_forecast = None
+      else:
+        interval_cols = future_quantile_forecast[:, [1, 9]]
+        finite_mask = np.isfinite(interval_cols).all(axis=1)
+        if not np.any(finite_mask):
+          _log(
+              logs,
+              f"Warning: {model_label} forecast quantile bounds were non-finite; dropping interval shading.",
+              verbose=verbose,
+          )
+          future_quantile_forecast = None
+        elif not np.all(finite_mask):
+          last_valid_idx = int(np.where(finite_mask)[0][-1])
+          trim_len = last_valid_idx + 1
+          future_point_forecast = future_point_forecast[:trim_len]
+          future_quantile_forecast = future_quantile_forecast[:trim_len]
+          trimmed = True
+    if trimmed:
+      _log(
+          logs,
+          f"Warning: {model_label} future forecast truncated to {len(future_point_forecast)} steps because quantile bounds were non-finite beyond that horizon.",
+          verbose=verbose,
+      )
+
+    future_quantile_shape = future_quantile_forecast.shape if future_quantile_forecast is not None else None
+    _log(
+        logs,
+        f"\n[{model_label}] Backtest window: {holdout_len} days. Future forecast horizon: {len(future_point_forecast)} days (quantiles {future_quantile_shape}).",
+        verbose=verbose,
+    )
+    if not math.isnan(mape):
+      _log(logs, f"[{model_label}] Backtest MAPE ({holdout_len} days): {mape:.3f}%", verbose=verbose)
+    else:
+      _log(logs, f"[{model_label}] Backtest MAPE: undefined (division by zero encountered).", verbose=verbose)
+
+    residuals = ts_context.holdout_values - backtest_forecast
+    bundle_metadata = {
+        "mape": mape,
+        "backtest_horizon": holdout_len,
+        "future_horizon": len(future_point_forecast),
+    }
+    bundles.append(
+        ForecastBundle(
+            model_key=model_key,
+            model_label=model_label,
+            point_forecast=future_point_forecast.astype(np.float32, copy=True),
+            quantile_forecast=
+            future_quantile_forecast.astype(np.float32, copy=True)
+            if future_quantile_forecast is not None
+            else None,
+            backtest_forecast=backtest_forecast.astype(np.float32, copy=True),
+            residuals=residuals.astype(np.float32, copy=True),
+            context_used=future_result.context_used,
+            metadata=bundle_metadata,
+        )
+    )
+
+  extra = {
+      "raw_times": full_raw_times,
+      "raw_values": full_raw_values,
+      "smoothed": bool(smoothing_window),
+      "logs": logs,
+  }
+  return ts_context, bundles, extra
+
+
+def build_forecast_figure(
     ts_context: TimeSeriesContext,
     bundles: Sequence[ForecastBundle],
-    chart_path: str,
     *,
     raw_times: Optional[List[datetime]] = None,
     raw_values: Optional[np.ndarray] = None,
     smoothed: bool = False,
     search_query: Optional[str] = None,
-) -> None:
+) -> "go.Figure":
   if not bundles:
     raise ValueError("At least one forecast bundle is required for rendering.")
 
@@ -441,11 +825,11 @@ def render_forecast_panels(
           y=0.98,
           showarrow=False,
           font=dict(size=12),
-          align="right",
-          bgcolor="rgba(255,255,255,0.85)",
-          bordercolor="rgba(0,0,0,0.15)",
-          borderwidth=1,
-          borderpad=4,
+      align="right",
+      bgcolor="rgba(255,255,255,0.85)",
+      bordercolor="rgba(0,0,0,0.15)",
+      borderwidth=1,
+      borderpad=4,
       )
 
     fig.update_yaxes(
@@ -496,6 +880,34 @@ def render_forecast_panels(
       bordercolor="rgba(0,0,0,0.15)",
       borderwidth=1,
       borderpad=6,
+  )
+
+  return fig
+
+
+def render_forecast_panels(
+    ts_context: TimeSeriesContext,
+    bundles: Sequence[ForecastBundle],
+    chart_path: str,
+    *,
+    raw_times: Optional[List[datetime]] = None,
+    raw_values: Optional[np.ndarray] = None,
+    smoothed: bool = False,
+    search_query: Optional[str] = None,
+) -> None:
+  try:
+    import plotly.graph_objects as go  # noqa: F401  # Ensures plotly available for saving
+  except ImportError as exc:  # pragma: no cover
+    raise SystemExit("plotly is required for plotting; install with `pip install plotly`."
+                     ) from exc
+
+  fig = build_forecast_figure(
+      ts_context,
+      bundles,
+      raw_times=raw_times,
+      raw_values=raw_values,
+      smoothed=smoothed,
+      search_query=search_query,
   )
 
   output_path = Path(chart_path)
@@ -595,40 +1007,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
   args = parser.parse_args(argv)
 
-  unit_label, _ = _resolve_units(args.smooth)
-  horizon_spec = _parse_quantity_arg(
-      args.horizon,
-      default_magnitude=182,
-      default_unit=unit_label,
-      param_name="horizon",
-  )
-  assert horizon_spec is not None  # for type checkers
-  horizon_days = horizon_spec.days
-  horizon_unit_scale = _UNIT_SCALES[horizon_spec.unit_label]
-  if horizon_days < 20:
-    min_units = max(1, math.ceil(20 / horizon_unit_scale))
-    raise SystemExit(
-        f"horizon must be at least {min_units} {horizon_spec.unit_label} to satisfy a 4-point holdout (35% rule)."
-    )
-  if horizon_days > MAX_HORIZON_DAYS:
-    raise SystemExit(
-        f"horizon is capped at {MAX_HORIZON_DAYS} days (~5 years); requested {horizon_spec.magnitude} {horizon_spec.unit_label}."
-    )
-
-  eval_spec = _parse_quantity_arg(
-      args.eval_window,
-      default_magnitude=DEFAULT_EVAL_DAYS,
-      default_unit="days",
-      param_name="eval-window",
-  )
-
-  context_spec = _parse_quantity_arg(
-      args.max_context,
-      default_magnitude=None,
-      default_unit=unit_label,
-      param_name="max-context",
-  )
-
   extra_params: Dict[str, str] = {}
   if args.extra:
     for kv in args.extra:
@@ -637,257 +1015,62 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
       key, value = kv.split("=", 1)
       extra_params[key] = value
 
-  payload = fetch_timeline_vol(
-      query=args.query,
+  normalized_query = _normalize_query_string(args.query)
+
+  if args.skip_forecast:
+    payload = fetch_timeline_vol(
+        query=normalized_query,
+        mode=args.mode,
+        timespan=args.timespan,
+        start_datetime=args.start_datetime,
+        end_datetime=args.end_datetime,
+        timeline_smooth=args.timelinesmooth,
+        extra_params=extra_params if extra_params else None,
+        timeout=args.timeout,
+    )
+
+    arrays, timestamps = timeline_to_daily_arrays(payload)
+    if not arrays:
+      print("No timeline data returned for the given query.", file=sys.stderr)
+      return 1
+
+    print("Prepared TimesFM inputs (daily cadence):")
+    for idx, arr in enumerate(arrays):
+      print(f"Series {idx}: shape={arr.shape}, dtype={arr.dtype}")
+    print(arrays)
+
+    print("\nCorresponding timestamps:")
+    for idx, times in enumerate(timestamps):
+      start = times[0]
+      end = times[-1]
+      print(f"Series {idx}: {len(times)} points from {start.isoformat()} to {end.isoformat()}")
+
+    return 0
+  ts_context, bundles, extra = generate_forecast_artifacts(
+      query=normalized_query,
       mode=args.mode,
       timespan=args.timespan,
       start_datetime=args.start_datetime,
       end_datetime=args.end_datetime,
       timeline_smooth=args.timelinesmooth,
       extra_params=extra_params if extra_params else None,
-      timeout=args.timeout,
+      series_index=args.series_index,
+      models=args.models,
+      max_context=args.max_context,
+      eval_window=args.eval_window,
+      horizon=args.horizon,
+      smooth=args.smooth,
+      timesfm_root=args.timesfm_root,
+      verbose=True,
   )
-
-  arrays, timestamps = timeline_to_daily_arrays(payload)
-  if not arrays:
-    print("No timeline data returned for the given query.", file=sys.stderr)
-    return 1
-
-  print("Prepared TimesFM inputs (daily cadence):")
-  for idx, arr in enumerate(arrays):
-    print(f"Series {idx}: shape={arr.shape}, dtype={arr.dtype}")
-  print(arrays)
-
-  print("\nCorresponding timestamps:")
-  for idx, times in enumerate(timestamps):
-    start = times[0]
-    end = times[-1]
-    print(f"Series {idx}: {len(times)} points from {start.isoformat()} to {end.isoformat()}")
-
-  if args.skip_forecast:
-    return 0
-
-  if args.series_index >= len(arrays) or args.series_index < 0:
-    raise SystemExit("series index out of range")
-
-  raw_values_all = arrays[args.series_index].astype(np.float32, copy=True)
-  raw_times_all = list(timestamps[args.series_index])
-
-  selected_values = raw_values_all
-  selected_times = raw_times_all
-
-  context_limit: Optional[int] = None
-  if context_spec is not None:
-    context_limit = context_spec.days
-    if len(selected_values) > context_limit:
-      print(
-          f"Trimming context to last {context_limit} days (~{context_spec.magnitude} {context_spec.unit_label}).",
-          file=sys.stderr,
-      )
-      selected_values = selected_values[-context_limit :]
-      selected_times = selected_times[-context_limit :]
-
-  full_raw_values = raw_values_all
-  full_raw_times = raw_times_all
-
-  smoothing_window = SMOOTH_WINDOWS.get(args.smooth) if args.smooth else None
-  if smoothing_window:
-    if len(selected_values) < smoothing_window:
-      print(
-          f"Warning: smoothing window ({smoothing_window} days) exceeds available series length ({len(selected_values)}); partial averages will be used.",
-          file=sys.stderr,
-      )
-    selected_values = moving_average(selected_values, smoothing_window)
-    print(f"\nApplied {args.smooth} smoothing (window {smoothing_window} days) before forecasting.")
-
-  num_points = len(selected_values)
-  if num_points < 5:
-    raise SystemExit(
-        "Need at least 5 data points after preprocessing to run the evaluation backtest and future forecast."
-    )
-
-  max_holdout = max(0, num_points - 4)
-  if max_holdout <= 0:
-    raise SystemExit(
-        "Not enough data to reserve an evaluation window while preserving at least 4 context points."
-    )
-
-  requested_holdout = eval_spec.days
-  if requested_holdout > max_holdout:
-    print(
-        f"Evaluation window ({requested_holdout} days) truncated to {max_holdout} days to preserve minimum context.",
-        file=sys.stderr,
-    )
-    holdout_len = max_holdout
-  else:
-    holdout_len = requested_holdout
-
-  if holdout_len < 1:
-    raise SystemExit("Evaluation window collapsed; provide more data or reduce --eval-window.")
-
-  backtest_context_values = selected_values[:-holdout_len]
-  backtest_context_times = selected_times[:-holdout_len]
-  holdout_actual = selected_values[-holdout_len:]
-  holdout_times = selected_times[-holdout_len:]
-  context_len = len(backtest_context_values)
-  if context_len < 4:
-    raise SystemExit(
-        f"Not enough context ({context_len}) after reserving the evaluation window; need at least 4 points."
-    )
-  if context_len < 10:
-    print(
-        f"Warning: only {context_len} context points available for the backtest; forecasts may be unstable.",
-        file=sys.stderr,
-    )
-
-  if horizon_days > context_len * 3:
-    print(
-        f"Warning: horizon spans {horizon_days} days (~{horizon_spec.magnitude} {horizon_spec.unit_label}), exceeding 3x the backtest context length ({context_len} days).",
-        file=sys.stderr,
-    )
-
-  if len(selected_times) >= 2:
-    timestamp_cadence = selected_times[1] - selected_times[0]
-  elif len(backtest_context_times) >= 2:
-    timestamp_cadence = backtest_context_times[1] - backtest_context_times[0]
-  else:
-    raise SystemExit("Unable to infer timestamp cadence for the selected series.")
-  if timestamp_cadence <= timedelta(0):
-    raise SystemExit("Non-positive timestamp cadence detected; cannot proceed.")
-
-  context_metadata: Dict[str, object] = {}
-  if context_limit is not None:
-    context_metadata["max_context"] = context_limit
-
-  ts_context = TimeSeriesContext(
-      series_id=args.query,
-      timestamp_cadence=timestamp_cadence,
-      full_history=full_raw_values,
-      full_timestamps=full_raw_times,
-      context_values=backtest_context_values,
-      context_timestamps=backtest_context_times,
-      model_values=selected_values,
-      model_timestamps=selected_times,
-      holdout_values=holdout_actual,
-      holdout_timestamps=holdout_times,
-      forecast_horizon=horizon_days,
-      metadata=context_metadata,
-  )
-
-  bundles: List[ForecastBundle] = []
-  for model_key in args.models:
-    runner = FORECAST_MODEL_REGISTRY[model_key]
-    model_label = MODEL_LABELS.get(model_key, model_key)
-
-    backtest_context = ts_context.with_context_override(
-        values=ts_context.context_values,
-        timestamps=ts_context.context_timestamps,
-        forecast_horizon=holdout_len,
-    )
-    backtest_result = runner(backtest_context, args)
-    if backtest_result.point_forecast.shape[0] < holdout_len:
-      raise SystemExit(
-          f"{model_label} returned fewer steps than requested for the backtest window; cannot score MAPE."
-      )
-    backtest_forecast = backtest_result.point_forecast[:holdout_len]
-
-    with np.errstate(divide="ignore", invalid="ignore"):
-      denom = np.abs(ts_context.holdout_values)
-      mask = denom > 1e-6
-      if np.any(mask):
-        mape = float(
-            np.mean(
-                np.abs((ts_context.holdout_values[mask] - backtest_forecast[mask]) / denom[mask])
-            )
-            * 100.0
-        )
-      else:
-        mape = float("nan")
-
-    future_context = ts_context.with_context_override(
-        values=ts_context.model_values,
-        timestamps=ts_context.model_timestamps,
-        forecast_horizon=ts_context.forecast_horizon,
-    )
-    future_result = runner(future_context, args)
-
-    future_point_forecast = future_result.point_forecast
-    if future_point_forecast.size == 0:
-      raise SystemExit(f"{model_label} returned an empty future forecast.")
-    if future_point_forecast.shape[0] < horizon_days:
-      print(
-          f"Warning: {model_label} future forecast returned {future_point_forecast.shape[0]} steps (requested {horizon_days}); plotting uses the returned length.",
-          file=sys.stderr,
-      )
-
-    future_quantile_forecast = future_result.quantile_forecast
-    trimmed = False
-    if future_quantile_forecast is not None:
-      if future_quantile_forecast.ndim != 2 or future_quantile_forecast.shape[1] < 10:
-        print(
-            f"Warning: {model_label} quantiles missing 10th/90th percentiles; interval shading disabled.",
-            file=sys.stderr,
-        )
-        future_quantile_forecast = None
-      else:
-        interval_cols = future_quantile_forecast[:, [1, 9]]
-        finite_mask = np.isfinite(interval_cols).all(axis=1)
-        if not np.any(finite_mask):
-          print(
-              f"Warning: {model_label} forecast quantile bounds were non-finite; dropping interval shading.",
-              file=sys.stderr,
-          )
-          future_quantile_forecast = None
-        elif not np.all(finite_mask):
-          last_valid_idx = int(np.where(finite_mask)[0][-1])
-          trim_len = last_valid_idx + 1
-          future_point_forecast = future_point_forecast[:trim_len]
-          future_quantile_forecast = future_quantile_forecast[:trim_len]
-          trimmed = True
-    if trimmed:
-      print(
-          f"Warning: {model_label} future forecast truncated to {len(future_point_forecast)} steps because quantile bounds were non-finite beyond that horizon.",
-          file=sys.stderr,
-      )
-
-    future_quantile_shape = future_quantile_forecast.shape if future_quantile_forecast is not None else None
-    print(
-        f"\n[{model_label}] Backtest window: {holdout_len} days. Future forecast horizon: {len(future_point_forecast)} days (quantiles {future_quantile_shape})."
-    )
-    if not math.isnan(mape):
-      print(f"[{model_label}] Backtest MAPE ({holdout_len} days): {mape:.3f}%")
-    else:
-      print(f"[{model_label}] Backtest MAPE: undefined (division by zero encountered).")
-
-    residuals = ts_context.holdout_values - backtest_forecast
-    bundle_metadata = {
-        "mape": mape,
-        "backtest_horizon": holdout_len,
-        "future_horizon": len(future_point_forecast),
-    }
-    bundles.append(
-        ForecastBundle(
-            model_key=model_key,
-            model_label=model_label,
-            point_forecast=future_point_forecast.astype(np.float32, copy=True),
-            quantile_forecast=
-            future_quantile_forecast.astype(np.float32, copy=True)
-            if future_quantile_forecast is not None
-            else None,
-            backtest_forecast=backtest_forecast.astype(np.float32, copy=True),
-            residuals=residuals.astype(np.float32, copy=True),
-            context_used=future_result.context_used,
-            metadata=bundle_metadata,
-        )
-    )
 
   render_forecast_panels(
       ts_context,
       bundles,
       args.chart_path,
-      raw_times=full_raw_times,
-      raw_values=full_raw_values,
-      smoothed=bool(smoothing_window),
+      raw_times=extra["raw_times"],
+      raw_values=extra["raw_values"],
+      smoothed=extra["smoothed"],
       search_query=args.query,
   )
 

@@ -15,7 +15,7 @@ source .venv/bin/activate
 
 # Install core dependencies
 pip install -r requirements.txt  # (if you generate one)
-pip install plotly prophet pandas numpy statsmodels
+pip install plotly prophet pandas numpy statsmodels streamlit
 
 # Clone TimesFM (kept in a separate repo)
 git clone git@github.com:sidscorp/timesfm-sn.git timesfm
@@ -32,8 +32,21 @@ python gdelt_timeseries.py "ai AND robotics" \
   --timespan 104weeks \
   --max-context 52weeks \
   --horizon 26weeks \
-  --chart-path outputs/ai_forecast.png
+--chart-path outputs/ai_forecast.png
 ```
+
+## Streamlit dashboard
+
+```bash
+streamlit run dashboard.py
+```
+
+The app lets you:
+- load a GDELT timeline for any query,
+- adjust forecasting settings (models, horizon, smoothing, etc.),
+- visualize stacked forecasts (TimesFM, Prophet, ARIMA, Exponential Smoothing) with backtest MAPEs.
+
+Queries typed into either the CLI or dashboard are normalized automatically: multi-word phrases are quoted and boolean operators (`AND`, `OR`, `NOT`) are uppercased, so you can type expressions such as `Tesla OR SpaceX` or `((climate change) AND policy)` directly.
 
 Key CLI options:
 - `--timespan`, `--max-context`, `--horizon`, `--eval-window` accept numbers with unit suffixes (`26weeks`, `6months`, `180`).
