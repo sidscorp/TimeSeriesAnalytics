@@ -1,6 +1,6 @@
 # TimeSeriesAnalytics
 
-Utilities for fetching GDELT coverage timelines and benchmarking multiple forecasting backends (TimesFM, Prophet, …) on a shared Time Series Data Model (TSDM).
+Utilities for fetching GDELT coverage timelines and benchmarking multiple forecasting backends (TimesFM, Prophet, Exponential Smoothing, ARIMA, …) on a shared Time Series Data Model (TSDM).
 
 ## Quick start
 
@@ -15,7 +15,7 @@ source .venv/bin/activate
 
 # Install core dependencies
 pip install -r requirements.txt  # (if you generate one)
-pip install plotly prophet pandas numpy
+pip install plotly prophet pandas numpy statsmodels
 
 # Clone TimesFM (kept in a separate repo)
 git clone git@github.com:sidscorp/timesfm-sn.git timesfm
@@ -26,9 +26,9 @@ git clone git@github.com:sidscorp/timesfm-sn.git timesfm
 ```bash
 python gdelt_timeseries.py "covid OR coronavirus"
 
-# Run both TimesFM and Prophet stacked in the output chart
+# Run multiple models stacked in the output chart
 python gdelt_timeseries.py "ai AND robotics" \
-  --models timesfm prophet \
+  --models timesfm prophet expsmooth arima \
   --timespan 104weeks \
   --max-context 52weeks \
   --horizon 26weeks \
@@ -38,7 +38,7 @@ python gdelt_timeseries.py "ai AND robotics" \
 Key CLI options:
 - `--timespan`, `--max-context`, `--horizon`, `--eval-window` accept numbers with unit suffixes (`26weeks`, `6months`, `180`).
 - `--smooth` enables weekly/monthly moving averages before forecasting.
-- `--models` lets you stack multiple backends; each panel reports its own backtest MAPE.
+- `--models` lets you stack multiple backends (timesfm, prophet, expsmooth, arima); each panel reports its own backtest MAPE.
 
 ## Project layout
 

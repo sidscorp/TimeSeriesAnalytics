@@ -21,6 +21,8 @@ from forecasting import (
     ForecastBundle,
     ForecastResult,
     TimeSeriesContext,
+    forecast_arima,
+    forecast_exponential_smoothing,
     forecast_timesfm,
 )
 
@@ -87,14 +89,36 @@ def _forecast_with_prophet(context: TimeSeriesContext, args: argparse.Namespace)
   )
 
 
+def _forecast_with_expsmooth(context: TimeSeriesContext, args: argparse.Namespace) -> ForecastResult:
+  del args  # Currently unused
+  return forecast_exponential_smoothing(
+      context.context_values,
+      context.forecast_horizon,
+      max_context=context.metadata.get("max_context") if context.metadata else None,
+  )
+
+
+def _forecast_with_arima(context: TimeSeriesContext, args: argparse.Namespace) -> ForecastResult:
+  del args  # Currently unused
+  return forecast_arima(
+      context.context_values,
+      context.forecast_horizon,
+      max_context=context.metadata.get("max_context") if context.metadata else None,
+  )
+
+
 FORECAST_MODEL_REGISTRY: Dict[str, ForecastRunner] = {
     "timesfm": _forecast_with_timesfm,
     "prophet": _forecast_with_prophet,
+    "expsmooth": _forecast_with_expsmooth,
+    "arima": _forecast_with_arima,
 }
 
 MODEL_LABELS = {
     "timesfm": "TimesFM",
     "prophet": "Prophet",
+    "expsmooth": "Exponential Smoothing",
+    "arima": "ARIMA",
 }
 
 
@@ -249,7 +273,12 @@ def render_forecast_panels(
     raise SystemExit("plotly is required for plotting; install with `pip install plotly`."
                      ) from exc
 
-  num_rows = len(bundles)
+  num_panels = len(bundles)
+  if num_panels == 4:
+    cols = 2
+  else:
+    cols = 1
+  rows = math.ceil(num_panels / cols)
   subplot_titles = [bundle.model_label for bundle in bundles]
 
   history_times = list(ts_context.context_timestamps)
@@ -260,15 +289,21 @@ def render_forecast_panels(
   delta = ts_context.timestamp_cadence
 
   fig = make_subplots(
-      rows=num_rows,
-      cols=1,
-      shared_xaxes=True,
-      vertical_spacing=0.09 if num_rows > 1 else 0.04,
+      rows=rows,
+      cols=cols,
+      shared_xaxes=False,
+      vertical_spacing=0.12 if rows > 1 else 0.06,
+      horizontal_spacing=0.08 if cols > 1 else 0.04,
       subplot_titles=subplot_titles,
   )
 
-  for row_index, bundle in enumerate(bundles, start=1):
-    showlegend = row_index == 1
+  for idx, bundle in enumerate(bundles):
+    row_index = idx // cols + 1
+    col_index = idx % cols + 1
+    showlegend = idx == 0
+    axis_index = idx + 1
+    x_domain_ref = "x domain" if axis_index == 1 else f"x{axis_index} domain"
+    y_domain_ref = "y domain" if axis_index == 1 else f"y{axis_index} domain"
 
     if not history_times:
       raise ValueError("History times must be non-empty for plotting.")
@@ -294,7 +329,7 @@ def render_forecast_panels(
               showlegend=showlegend,
           ),
           row=row_index,
-          col=1,
+          col=col_index,
       )
 
     context_label = "context (smoothed)" if smoothed else "context"
@@ -309,7 +344,7 @@ def render_forecast_panels(
             showlegend=showlegend,
         ),
         row=row_index,
-        col=1,
+        col=col_index,
     )
 
     if holdout_times:
@@ -326,7 +361,7 @@ def render_forecast_panels(
               showlegend=showlegend,
           ),
           row=row_index,
-          col=1,
+          col=col_index,
       )
 
       if bundle.backtest_forecast.size and len(bundle.backtest_forecast) == len(holdout_times):
@@ -342,7 +377,7 @@ def render_forecast_panels(
                 showlegend=showlegend,
             ),
             row=row_index,
-            col=1,
+            col=col_index,
         )
 
     if bundle.quantile_forecast is not None and bundle.quantile_forecast.shape[0] >= len(future_times):
@@ -362,7 +397,7 @@ def render_forecast_panels(
                 hoverinfo="skip",
             ),
             row=row_index,
-            col=1,
+            col=col_index,
         )
         fig.add_trace(
             go.Scatter(
@@ -378,7 +413,7 @@ def render_forecast_panels(
                 showlegend=showlegend,
             ),
             row=row_index,
-            col=1,
+            col=col_index,
         )
 
     if bundle.point_forecast.size:
@@ -393,17 +428,15 @@ def render_forecast_panels(
               showlegend=showlegend,
           ),
           row=row_index,
-          col=1,
+          col=col_index,
       )
 
     mape = bundle.metadata.get("mape") if bundle.metadata else None
     if mape is not None and not math.isnan(mape):
-      xref = "x domain" if row_index == 1 else f"x{row_index} domain"
-      yref = "y domain" if row_index == 1 else f"y{row_index} domain"
       fig.add_annotation(
           text=f"Backtest MAPE: {mape:.2f}%",
-          xref=xref,
-          yref=yref,
+          xref=x_domain_ref,
+          yref=y_domain_ref,
           x=0.98,
           y=0.98,
           showarrow=False,
@@ -414,6 +447,15 @@ def render_forecast_panels(
           borderwidth=1,
           borderpad=4,
       )
+
+    fig.update_yaxes(
+        title_text="Volume intensity",
+        row=row_index,
+        col=col_index,
+        showgrid=True,
+        gridcolor="rgba(0,0,0,0.08)",
+        zeroline=False,
+    )
 
   fig.update_layout(
       template="simple_white",
@@ -428,19 +470,12 @@ def render_forecast_panels(
           bordercolor="rgba(0,0,0,0.15)",
           borderwidth=1,
       ),
-      margin=dict(l=50, r=20, t=90, b=170),
+      margin=dict(l=60, r=30, t=90, b=170),
       hovermode="x unified",
       font=dict(family="Helvetica, Arial, sans-serif", size=12, color="#222222"),
       plot_bgcolor="white",
       paper_bgcolor="white",
-      height=max(360, 360 * num_rows),
-  )
-
-  fig.update_yaxes(
-      title_text="Volume intensity",
-      showgrid=True,
-      gridcolor="rgba(0,0,0,0.08)",
-      zeroline=False,
+      height=max(400, 360 * rows),
   )
 
   subtitle_parts = ["GDELT coverage volume forecasts"]
@@ -514,7 +549,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
       nargs="+",
       default=["timesfm"],
       choices=sorted(FORECAST_MODEL_REGISTRY),
-      help="Forecasting backends to run (choose timesfm, prophet; default: timesfm).",
+      help=(
+          "Forecasting backends to run (choose from timesfm, prophet, expsmooth, arima; "
+          "default: timesfm)."
+      ),
   )
   parser.add_argument(
       "--max-context",
