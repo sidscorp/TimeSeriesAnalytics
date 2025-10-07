@@ -17,7 +17,12 @@ from urllib.request import urlopen
 
 import numpy as np
 
-from forecasting import ForecastResult, forecast_timesfm
+from forecasting import (
+    ForecastBundle,
+    ForecastResult,
+    TimeSeriesContext,
+    forecast_timesfm,
+)
 
 BASE_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
 DATE_FMT = "%Y%m%dT%H%M%SZ"
@@ -57,55 +62,28 @@ class UnitQuantity:
   days: int
 
 
-@dataclass(frozen=True)
-class PanelForecast:
-  model_key: str
-  model_label: str
-  history_times: List[datetime]
-  history_values: np.ndarray
-  holdout_times: List[datetime]
-  holdout_actual: np.ndarray
-  backtest_forecast: np.ndarray
-  observed_times: List[datetime]
-  future_forecast: np.ndarray
-  future_quantiles: Optional[np.ndarray]
-  mape: float
+ForecastRunner = Callable[[TimeSeriesContext, argparse.Namespace], ForecastResult]
 
 
-ForecastRunner = Callable[[np.ndarray, Sequence[datetime], int, Optional[int], argparse.Namespace], ForecastResult]
-
-
-def _forecast_with_timesfm(
-    values: np.ndarray,
-    times: Sequence[datetime],
-    horizon: int,
-    context_limit: Optional[int],
-    args: argparse.Namespace,
-) -> ForecastResult:
-  del times  # Unused for TimesFM
+def _forecast_with_timesfm(context: TimeSeriesContext, args: argparse.Namespace) -> ForecastResult:
+  max_context = context.metadata.get("max_context") if context.metadata else None
   return forecast_timesfm(
-      values,
-      horizon,
-      max_context=context_limit,
+      context.context_values,
+      context.forecast_horizon,
+      max_context=max_context,
       timesfm_root=args.timesfm_root,
   )
 
 
-def _forecast_with_prophet(
-    values: np.ndarray,
-    times: Sequence[datetime],
-    horizon: int,
-    context_limit: Optional[int],
-    args: argparse.Namespace,
-) -> ForecastResult:
+def _forecast_with_prophet(context: TimeSeriesContext, args: argparse.Namespace) -> ForecastResult:
   from forecasting import forecast_prophet
 
   del args  # Currently unused
   return forecast_prophet(
-      values,
-      times,
-      horizon,
-      max_context=context_limit,
+      context.context_values,
+      context.context_timestamps,
+      context.forecast_horizon,
+      max_context=context.metadata.get("max_context") if context.metadata else None,
   )
 
 
@@ -252,7 +230,8 @@ def moving_average(values: np.ndarray, window: int) -> np.ndarray:
 
 
 def render_forecast_panels(
-    panels: List[PanelForecast],
+    ts_context: TimeSeriesContext,
+    bundles: Sequence[ForecastBundle],
     chart_path: str,
     *,
     raw_times: Optional[List[datetime]] = None,
@@ -260,8 +239,8 @@ def render_forecast_panels(
     smoothed: bool = False,
     search_query: Optional[str] = None,
 ) -> None:
-  if not panels:
-    raise ValueError("At least one forecast panel is required for rendering.")
+  if not bundles:
+    raise ValueError("At least one forecast bundle is required for rendering.")
 
   try:
     import plotly.graph_objects as go
@@ -270,8 +249,15 @@ def render_forecast_panels(
     raise SystemExit("plotly is required for plotting; install with `pip install plotly`."
                      ) from exc
 
-  num_rows = len(panels)
-  subplot_titles = [panel.model_label for panel in panels]
+  num_rows = len(bundles)
+  subplot_titles = [bundle.model_label for bundle in bundles]
+
+  history_times = list(ts_context.context_timestamps)
+  history_values = ts_context.context_values
+  holdout_times = list(ts_context.holdout_timestamps)
+  holdout_actual = ts_context.holdout_values
+  observed_times = list(ts_context.model_timestamps)
+  delta = ts_context.timestamp_cadence
 
   fig = make_subplots(
       rows=num_rows,
@@ -281,23 +267,17 @@ def render_forecast_panels(
       subplot_titles=subplot_titles,
   )
 
-  for row_index, panel in enumerate(panels, start=1):
+  for row_index, bundle in enumerate(bundles, start=1):
     showlegend = row_index == 1
 
-    if len(panel.history_times) < 1:
+    if not history_times:
       raise ValueError("History times must be non-empty for plotting.")
-    if len(panel.observed_times) >= 2:
-      delta = panel.observed_times[-1] - panel.observed_times[-2]
-    elif len(panel.history_times) >= 2:
-      delta = panel.history_times[-1] - panel.history_times[-2]
-    else:
-      raise ValueError("Unable to infer cadence for plotting future horizon.")
     if delta <= timedelta(0):
       raise ValueError("Non-positive timestep detected in timeline.")
 
     future_times: List[datetime] = []
-    last_time = panel.observed_times[-1]
-    for _ in range(len(panel.future_forecast)):
+    last_time = observed_times[-1]
+    for _ in range(len(bundle.point_forecast)):
       last_time = last_time + delta
       future_times.append(last_time)
 
@@ -320,8 +300,8 @@ def render_forecast_panels(
     context_label = "context (smoothed)" if smoothed else "context"
     fig.add_trace(
         go.Scatter(
-            x=panel.history_times,
-            y=panel.history_values,
+            x=history_times,
+            y=history_values,
             mode="lines",
             name=context_label,
             line=dict(color="#1f77b4", width=2.0),
@@ -332,12 +312,12 @@ def render_forecast_panels(
         col=1,
     )
 
-    if panel.holdout_times:
+    if holdout_times:
       holdout_label = "holdout actual (smoothed)" if smoothed else "holdout actual"
       fig.add_trace(
           go.Scatter(
-              x=panel.holdout_times,
-              y=panel.holdout_actual,
+              x=holdout_times,
+              y=holdout_actual,
               mode="lines+markers",
               name=holdout_label,
               line=dict(color="#2ca02c", width=1.5),
@@ -349,11 +329,11 @@ def render_forecast_panels(
           col=1,
       )
 
-      if panel.backtest_forecast.size and len(panel.backtest_forecast) == len(panel.holdout_times):
+      if bundle.backtest_forecast.size and len(bundle.backtest_forecast) == len(holdout_times):
         fig.add_trace(
             go.Scatter(
-                x=panel.holdout_times,
-                y=panel.backtest_forecast,
+                x=holdout_times,
+                y=bundle.backtest_forecast,
                 mode="lines+markers",
                 name="backtest forecast",
                 line=dict(color="#ff7f0e", width=1.5, dash="dash"),
@@ -365,10 +345,10 @@ def render_forecast_panels(
             col=1,
         )
 
-    if panel.future_quantiles is not None and panel.future_quantiles.shape[0] >= len(future_times):
+    if bundle.quantile_forecast is not None and bundle.quantile_forecast.shape[0] >= len(future_times):
       try:
-        lower_10 = panel.future_quantiles[: len(future_times), 1]
-        upper_90 = panel.future_quantiles[: len(future_times), 9]
+        lower_10 = bundle.quantile_forecast[: len(future_times), 1]
+        upper_90 = bundle.quantile_forecast[: len(future_times), 9]
       except IndexError:
         lower_10 = upper_90 = None
       if lower_10 is not None and upper_90 is not None:
@@ -401,11 +381,11 @@ def render_forecast_panels(
             col=1,
         )
 
-    if panel.future_forecast.size:
+    if bundle.point_forecast.size:
       fig.add_trace(
           go.Scatter(
               x=future_times,
-              y=panel.future_forecast,
+              y=bundle.point_forecast,
               mode="lines",
               name="forecast",
               line=dict(color="#ff7f0e", width=2.0),
@@ -416,11 +396,12 @@ def render_forecast_panels(
           col=1,
       )
 
-    if panel.mape is not None and not math.isnan(panel.mape):
+    mape = bundle.metadata.get("mape") if bundle.metadata else None
+    if mape is not None and not math.isnan(mape):
       xref = "x domain" if row_index == 1 else f"x{row_index} domain"
       yref = "y domain" if row_index == 1 else f"y{row_index} domain"
       fig.add_annotation(
-          text=f"Backtest MAPE: {panel.mape:.2f}%",
+          text=f"Backtest MAPE: {mape:.2f}%",
           xref=xref,
           yref=yref,
           x=0.98,
@@ -727,40 +708,70 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         file=sys.stderr,
     )
 
-  panels: List[PanelForecast] = []
+  if len(selected_times) >= 2:
+    timestamp_cadence = selected_times[1] - selected_times[0]
+  elif len(backtest_context_times) >= 2:
+    timestamp_cadence = backtest_context_times[1] - backtest_context_times[0]
+  else:
+    raise SystemExit("Unable to infer timestamp cadence for the selected series.")
+  if timestamp_cadence <= timedelta(0):
+    raise SystemExit("Non-positive timestamp cadence detected; cannot proceed.")
+
+  context_metadata: Dict[str, object] = {}
+  if context_limit is not None:
+    context_metadata["max_context"] = context_limit
+
+  ts_context = TimeSeriesContext(
+      series_id=args.query,
+      timestamp_cadence=timestamp_cadence,
+      full_history=full_raw_values,
+      full_timestamps=full_raw_times,
+      context_values=backtest_context_values,
+      context_timestamps=backtest_context_times,
+      model_values=selected_values,
+      model_timestamps=selected_times,
+      holdout_values=holdout_actual,
+      holdout_timestamps=holdout_times,
+      forecast_horizon=horizon_days,
+      metadata=context_metadata,
+  )
+
+  bundles: List[ForecastBundle] = []
   for model_key in args.models:
     runner = FORECAST_MODEL_REGISTRY[model_key]
     model_label = MODEL_LABELS.get(model_key, model_key)
 
-    backtest_result = runner(
-        backtest_context_values,
-        backtest_context_times,
-        holdout_len,
-        context_limit,
-        args,
+    backtest_context = ts_context.with_context_override(
+        values=ts_context.context_values,
+        timestamps=ts_context.context_timestamps,
+        forecast_horizon=holdout_len,
     )
+    backtest_result = runner(backtest_context, args)
     if backtest_result.point_forecast.shape[0] < holdout_len:
       raise SystemExit(
           f"{model_label} returned fewer steps than requested for the backtest window; cannot score MAPE."
       )
     backtest_forecast = backtest_result.point_forecast[:holdout_len]
+
     with np.errstate(divide="ignore", invalid="ignore"):
-      denom = np.abs(holdout_actual)
+      denom = np.abs(ts_context.holdout_values)
       mask = denom > 1e-6
       if np.any(mask):
         mape = float(
-            np.mean(np.abs((holdout_actual[mask] - backtest_forecast[mask]) / denom[mask])) * 100.0
+            np.mean(
+                np.abs((ts_context.holdout_values[mask] - backtest_forecast[mask]) / denom[mask])
+            )
+            * 100.0
         )
       else:
         mape = float("nan")
 
-    future_result = runner(
-        selected_values,
-        selected_times,
-        horizon_days,
-        context_limit,
-        args,
+    future_context = ts_context.with_context_override(
+        values=ts_context.model_values,
+        timestamps=ts_context.model_timestamps,
+        forecast_horizon=ts_context.forecast_horizon,
     )
+    future_result = runner(future_context, args)
 
     future_point_forecast = future_result.point_forecast
     if future_point_forecast.size == 0:
@@ -810,27 +821,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
       print(f"[{model_label}] Backtest MAPE: undefined (division by zero encountered).")
 
-    panels.append(
-        PanelForecast(
+    residuals = ts_context.holdout_values - backtest_forecast
+    bundle_metadata = {
+        "mape": mape,
+        "backtest_horizon": holdout_len,
+        "future_horizon": len(future_point_forecast),
+    }
+    bundles.append(
+        ForecastBundle(
             model_key=model_key,
             model_label=model_label,
-            history_times=list(backtest_context_times),
-            history_values=backtest_context_values.astype(np.float32, copy=True),
-            holdout_times=list(holdout_times),
-            holdout_actual=holdout_actual.astype(np.float32, copy=True),
-            backtest_forecast=backtest_forecast.astype(np.float32, copy=True),
-            observed_times=list(selected_times),
-            future_forecast=future_point_forecast.astype(np.float32, copy=True),
-            future_quantiles=
+            point_forecast=future_point_forecast.astype(np.float32, copy=True),
+            quantile_forecast=
             future_quantile_forecast.astype(np.float32, copy=True)
             if future_quantile_forecast is not None
             else None,
-            mape=mape,
+            backtest_forecast=backtest_forecast.astype(np.float32, copy=True),
+            residuals=residuals.astype(np.float32, copy=True),
+            context_used=future_result.context_used,
+            metadata=bundle_metadata,
         )
     )
 
   render_forecast_panels(
-      panels,
+      ts_context,
+      bundles,
       args.chart_path,
       raw_times=full_raw_times,
       raw_values=full_raw_values,
