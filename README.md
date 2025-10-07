@@ -1,6 +1,6 @@
 # TimeSeriesAnalytics
 
-Utilities for fetching GDELT coverage timelines and benchmarking multiple forecasting backends (TimesFM, Prophet, …).
+Utilities for fetching GDELT coverage timelines and benchmarking multiple forecasting backends (TimesFM, Prophet, …) on a shared Time Series Data Model (TSDM).
 
 ## Quick start
 
@@ -44,8 +44,8 @@ Key CLI options:
 
 ```
 TimeSeriesAnalytics/
-├── forecasting/            # model adapters (TimesFM, Prophet, common dataclasses)
-├── gdelt_timeseries.py     # CLI entry point for fetching/plotting forecasts
+├── forecasting/            # TSDM dataclasses + model adapters (TimesFM, Prophet, ...)
+├── gdelt_timeseries.py     # CLI entry point orchestration (fetch, evaluate, plot)
 ├── timesfm/                # cloned separately; ignored by this repo (see .gitignore)
 ├── Archive/                # personal scratch space (ignored)
 └── .venv/                  # optional virtual environment (ignored)
@@ -53,8 +53,9 @@ TimeSeriesAnalytics/
 
 ## Workflow notes
 
-- TimesFM is maintained in its own repository (`timesfm/`) so local tweaks can be committed and pushed separately. Clone your fork or add it as a submodule if you prefer.
-- The main repository tracks forecasting scripts, Plotly charting, and shared utilities; run `git status` before committing to keep TimesFM changes out.
+- TimesFM lives in its own repository (`timesfm/`) so local tweaks can be committed and pushed separately. Clone your fork or add it as a submodule if you prefer.
+- The main repository now standardizes data passing through a `TimeSeriesContext` (inputs) → `ForecastBundle` (outputs) flow, making it easy to drop in new forecasting adapters.
+- Run `git status` before committing to keep TimesFM changes out of this repo; the root `.gitignore` already excludes the nested clone and local artifacts.
 - For repeatable environment setup, consider adding a `requirements.txt` or `pyproject.toml` that captures Plotly, Prophet, pandas, numpy, etc.
 
 ## Roadmap
