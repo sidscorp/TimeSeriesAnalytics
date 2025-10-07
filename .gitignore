@@ -1,0 +1,15 @@
+# macOS
+.DS_Store
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+
+# Local archives or scratch work
+Archive/
+
+# Ignore nested TimesFM clone (tracked separately)
+timesfm/
