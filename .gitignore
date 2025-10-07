@@ -13,3 +13,6 @@ Archive/
 
 # Ignore nested TimesFM clone (tracked separately)
 timesfm/
+
+# Generated charts
+ai_timesfm_weekly.png
